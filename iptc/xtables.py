@@ -962,7 +962,7 @@ class xtables(object):
     def _loaded(self, name, ext):
         _loaded_exts['%s___%s' % (self.proto, name)] = ext
 
-    def _get_initfn_from_lib(self, name, lib):
+    def _get_initfn_from_lib(self, name, lib, libpath=None):
         try:
             initfn = getattr(lib, "libxt_%s_init" % (name))
         except AttributeError:
@@ -971,16 +971,82 @@ class xtables(object):
             if initfn is None and not self.no_alias_check:
                 if name in xtables._real_name:
                     name = xtables._real_name[name]
-                    initfn = self._get_initfn_from_lib(name, lib)
+                    initfn = self._get_initfn_from_lib(name, lib, libpath)
+            if initfn is None and libpath and os.path.exists(libpath):
+                # Try to resolve symlinks to find the real library name
+                real_path = os.path.realpath(libpath)
+                basename = os.path.basename(real_path)
+                if basename.startswith('libxt_') and basename.endswith('.so'):
+                    real_name = basename[6:-3]
+                    try:
+                        initfn = getattr(lib, "libxt_%s_init" % (real_name))
+                    except AttributeError:
+                        pass
         return initfn
+
+    def _reinit_with_lists_cleared(self, fn):
+        saved_items = []
+
+        def save_and_clear(ptr, list_type, struct_type):
+            if not isinstance(ptr, ct.c_void_p) or not ptr.value:
+                return None
+            addr = ptr.value
+            head = addr
+            while addr:
+                tgt = ct.cast(addr, ct.POINTER(struct_type))
+                saved_items.append((addr, tgt[0].next, list_type, struct_type))
+                next_addr = tgt[0].next
+                tgt[0].next = None
+                addr = next_addr
+            ptr.value = None
+            return head
+
+        saved_targets_head = save_and_clear(xtables._xtables_targets, 'targets', self._target_struct)
+        saved_pending_targets_head = save_and_clear(xtables._xtables_pending_targets, 'pending_targets', self._target_struct)
+        saved_matches_head = save_and_clear(xtables._xtables_matches, 'matches', self._match_struct)
+        saved_pending_matches_head = save_and_clear(xtables._xtables_pending_matches, 'pending_matches', self._match_struct)
+
+        try:
+            _wrap_voidfn(fn)
+        finally:
+            def restore(ptr, saved_head, list_type, struct_type):
+                if not isinstance(ptr, ct.c_void_p):
+                    return
+                if ptr.value:
+                    addr = ptr.value
+                    while True:
+                        tgt = ct.cast(addr, ct.POINTER(struct_type))
+                        if not tgt[0].next:
+                            break
+                        addr = tgt[0].next
+                    if saved_head:
+                        tgt = ct.cast(addr, ct.POINTER(struct_type))
+                        tgt[0].next = saved_head
+                elif saved_head:
+                    ptr.value = saved_head
+                
+                chain_items = [(a, n) for (a, n, t, st) in saved_items if t == list_type]
+                for i, (addr, next_ptr) in enumerate(chain_items):
+                    tgt = ct.cast(addr, ct.POINTER(struct_type))
+                    if i + 1 < len(chain_items):
+                        tgt[0].next = chain_items[i + 1][0]
+                    else:
+                        tgt[0].next = None
+
+            restore(xtables._xtables_targets, saved_targets_head, 'targets', self._target_struct)
+            restore(xtables._xtables_pending_targets, saved_pending_targets_head, 'pending_targets', self._target_struct)
+            restore(xtables._xtables_matches, saved_matches_head, 'matches', self._match_struct)
+            restore(xtables._xtables_pending_matches, saved_pending_matches_head, 'pending_matches', self._match_struct)
 
     def _try_extinit(self, name, lib):
         try:
+            libpath = None
             if type(lib) != ct.CDLL:
+                libpath = lib
                 lib = ct.CDLL(lib)
-            fn = self._get_initfn_from_lib(name, lib)
+            fn = self._get_initfn_from_lib(name, lib, libpath)
             if fn:
-                _wrap_voidfn(fn)
+                self._reinit_with_lists_cleared(fn)
                 return True
         except:
             pass
@@ -1010,6 +1076,20 @@ class xtables(object):
         ext = _loaded_exts.get('%s___%s' % (self.proto, name), None)
         return ext
 
+    def _find_manually(self, name, list_names, struct_type):
+        for list_name in list_names:
+            try:
+                ptr = ct.c_void_p.in_dll(_lib_xtables, list_name)
+            except ValueError:
+                continue
+            addr = ptr.value
+            while addr:
+                tgt = ct.cast(addr, ct.POINTER(struct_type))
+                if tgt[0].name == name and tgt[0].family in (NFPROTO_UNSPEC, self.proto):
+                    return addr
+                addr = tgt[0].next
+        return None
+
     @set_nfproto
     def find_match(self, name):
         if isinstance(name, str):
@@ -1024,6 +1104,8 @@ class xtables(object):
         if not match:
             self._try_register(name)
             match = xtables._xtables_find_match(name, XTF_DONT_LOAD, None)
+            if not match:
+                match = self._find_manually(name, ['xtables_matches', 'xtables_pending_matches'], self._match_struct)
             if not match:
                 return match
 
@@ -1045,6 +1127,8 @@ class xtables(object):
         if not target:
             self._try_register(name)
             target = xtables._xtables_find_target(name, XTF_DONT_LOAD)
+            if not target:
+                target = self._find_manually(name, ['xtables_targets', 'xtables_pending_targets'], self._target_struct)
             if not target:
                 return target
 
